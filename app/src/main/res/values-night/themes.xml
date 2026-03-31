@@ -1,0 +1,16 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Base.Theme.Rockey" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">@drawable/bg_main_surface</item>
+        <item name="android:windowIsTranslucent">false</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowShowWallpaper">false</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="colorPrimary">@color/accent</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="colorSecondary">@color/accent_dark</item>
+        <item name="colorSurface">@color/surface</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>
