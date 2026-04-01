@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.RemoteException
+import android.util.Log
 import com.rokid.os.sprite.tts.ITtsListener
 import com.rokid.os.sprite.tts.ITtsServer
 
@@ -15,6 +16,12 @@ class RokidTtsClient(
     context: Context,
     private val listener: Listener,
 ) {
+    companion object {
+        private const val TAG = "RokidTtsClient"
+        const val ASSIST_PACKAGE = "com.rokid.os.sprite.assistserver"
+        const val ACTION_TTS_SERVICE = "com.rokid.os.sprite.tts.TTS_SERVICE"
+    }
+
     interface Listener {
         fun onBound()
 
@@ -27,11 +34,6 @@ class RokidTtsClient(
         fun onPlaybackStopped(utteranceId: String)
     }
 
-    companion object {
-        const val ASSIST_PACKAGE = "com.rokid.os.sprite.assistserver"
-        const val ACTION_TTS_SERVICE = "com.rokid.os.sprite.tts.TTS_SERVICE"
-    }
-
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -42,12 +44,20 @@ class RokidTtsClient(
     private val ttsListener =
         object : ITtsListener.Stub() {
             override fun onTtsStart(utteranceId: String?) {
-                val id = utteranceId ?: return
+                val id = utteranceId ?: activeUtteranceId
+                if (id == null) {
+                    Log.w(TAG, "onTtsStart without utteranceId")
+                    return
+                }
                 mainHandler.post { listener.onPlaybackStarted(id) }
             }
 
             override fun onTtsStop(utteranceId: String?) {
-                val id = utteranceId ?: return
+                val id = utteranceId ?: activeUtteranceId
+                if (id == null) {
+                    Log.w(TAG, "onTtsStop without utteranceId")
+                    return
+                }
                 activeUtteranceId = null
                 mainHandler.post { listener.onPlaybackStopped(id) }
             }
@@ -122,7 +132,7 @@ class RokidTtsClient(
             activeUtteranceId = utteranceId
             binder.playTtsMsg(message, utteranceId, ttsListener)
             true
-        } catch (error: RemoteException) {
+        } catch (error: Exception) {
             remote = null
             activeUtteranceId = null
             isBound = false

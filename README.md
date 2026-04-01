@@ -25,7 +25,7 @@ Rockey 是一个运行在 Rokid 眼镜侧的 Android 应用，目标是打通以
 
 ## 当前能力
 
-- 支持连接 `ws://127.0.0.1:2478`（通常经 `adb reverse` 映射到本机 OpenClaw Gateway）
+- 支持连接 `ws://127.0.0.1:2478`（推荐经 `adb reverse` 映射到本机 bridge 2478）
 - 支持 Rokid Assist 回调接入和识别结果提取
 - 支持 Rokid TTS Binder 播报，失败时回退系统 TTS
 - 支持图片问答：拍照后以附件形式随问题发送给 Bridge/Gateway
@@ -41,11 +41,17 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 运行提示
 
-1. 确保本机 OpenClaw Gateway 在 `18789` 端口运行。
+1. 确保本机 OpenClaw Gateway 正常运行，并加载 `rokid-openclaw-bridge` 插件。
 2. 连接眼镜后执行：
+
+```bash
+adb reverse tcp:2478 tcp:2478
+```
+
+3. 若需兼容历史链路，再尝试：
 
 ```bash
 adb reverse tcp:2478 tcp:18789
 ```
 
-3. 启动 App，确认状态出现 Bridge 已连接后进行语音或图片问答。
+4. 启动 App，确认状态出现 Bridge 已连接后进行语音或图片问答。

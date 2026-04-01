@@ -44,10 +44,13 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "RockeyMain"
         private const val WS_URL = "ws://127.0.0.1:2478"
+        private val WS_FALLBACK_URLS = listOf("ws://127.0.0.1:18789")
         private const val DEFAULT_VOICE_PROMPT = "请直接分析我眼前的画面，并告诉我最重要的信息。"
         private const val RETRY_LISTEN_DELAY_MS = 900L
+        private const val MAX_TTS_TIMEOUT_MS = 45_000L
         private const val ROKID_ASSIST_PACKAGE = "com.rokid.os.sprite.assistserver"
         private val WAKE_WORDS = listOf("rockey", "洛奇", "洛基", "罗奇")
+        private val RECAPTURE_KEYWORDS = listOf("重拍", "再拍", "重新拍", "拍照", "看图", "截图", "拍一张")
     }
 
     private enum class RecognizerMode {
@@ -70,6 +73,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chatScroll: ScrollView
     private lateinit var voiceButton: MaterialButton
     private lateinit var reconnectButton: MaterialButton
+
+    private data class PendingSpeech(
+        val text: String,
+        val utteranceId: String,
+    )
 
     private var rokid: RokidCameraIntegration? = null
     private var huoyanManager: HuoyanManager? = null
@@ -99,10 +107,22 @@ class MainActivity : AppCompatActivity() {
     private var assistRecognitionPending = false
     private var assistRecognitionStartedAt = 0L
     private var lastListeningCueAt = 0L
+    private var pendingSpeech: PendingSpeech? = null
+    private var currentTtsTimeoutMs = MAX_TTS_TIMEOUT_MS
+    private var hasSentImageContext = false
 
     private val restartListeningRunnable = Runnable {
         startListening(reason = "auto")
     }
+
+    private val ttsTimeoutRunnable =
+        Runnable {
+            if (!isSpeaking) {
+                return@Runnable
+            }
+            appendSystemMessage("TTS 播报超时，已自动结束本次播报")
+            handleTtsPlaybackStopped()
+        }
 
     private val assistRecognitionTimeoutRunnable =
         Runnable {
@@ -366,12 +386,14 @@ class MainActivity : AppCompatActivity() {
                 },
             )
         appendSystemMessage("正在绑定 Rokid TtsService")
+        Log.i(TAG, "initRokidTts: binding Rokid TtsService")
         rokidTtsClient?.connect()
     }
 
     private fun fallbackToSystemTts(reason: String) {
         rokidTtsClient?.release()
         rokidTtsClient = null
+        Log.w(TAG, "fallbackToSystemTts: $reason")
         if (speakerMode == SpeakerMode.SYSTEM_TTS && ttsReady) {
             return
         }
@@ -448,10 +470,20 @@ class MainActivity : AppCompatActivity() {
             }
         })
         ttsReady = true
+        Log.i(TAG, "configureSystemTtsEngine: ready with $engineLabel")
+        val queued = pendingSpeech
+        if (queued != null) {
+            pendingSpeech = null
+            Log.i(TAG, "configureSystemTtsEngine: replay pending speech ${queued.utteranceId}")
+            speakAnswer(queued.text, queued.utteranceId)
+        }
     }
 
     private fun handleTtsPlaybackStarted(engineLabel: String) {
+        Log.i(TAG, "handleTtsPlaybackStarted: engine=$engineLabel timeoutMs=$currentTtsTimeoutMs")
         isSpeaking = true
+        mainHandler.removeCallbacks(ttsTimeoutRunnable)
+        mainHandler.postDelayed(ttsTimeoutRunnable, currentTtsTimeoutMs)
         updateStatus(
             state = "回答中",
             detail = "$engineLabel 正在播报回答",
@@ -460,6 +492,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleTtsPlaybackStopped() {
+        Log.i(TAG, "handleTtsPlaybackStopped")
+        mainHandler.removeCallbacks(ttsTimeoutRunnable)
         isSpeaking = false
         reportTtsFinished()
         if (rokid?.isLocalMode() == true) {
@@ -747,7 +781,10 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val socketClient = OkHttpSocketClient(WS_URL)
+        val socketClient = OkHttpSocketClient(
+            wsUrl = WS_URL,
+            fallbackWsUrls = WS_FALLBACK_URLS,
+        )
         val cameraProvider = object : HuoyanManager.CameraProvider {
             override fun capture(callback: HuoyanManager.PhotoCallback) {
                 val rokidInstance = rokid
@@ -805,6 +842,9 @@ class MainActivity : AppCompatActivity() {
 
                 override fun onError(error: String) {
                     awaitingAnswer = false
+                    if (error.contains("拍照", ignoreCase = true) || error.contains("图像", ignoreCase = true)) {
+                        hasSentImageContext = false
+                    }
                     appendSystemMessage(error)
                     reportAiFailure(error)
                     liveTranscriptText.text = "说话失败，稍后重试"
@@ -824,6 +864,7 @@ class MainActivity : AppCompatActivity() {
                     wsConnected = connected
                     bootstrapInProgress = false
                     if (connected) {
+                        hasSentImageContext = false
                         updateStatus(
                             state = if (rokid?.supportsAiScene() == true && !aiSceneActive) "待唤起" else "待命中",
                             detail = if (rokid?.supportsAiScene() == true && !aiSceneActive) {
@@ -842,6 +883,7 @@ class MainActivity : AppCompatActivity() {
                             scheduleListening(RETRY_LISTEN_DELAY_MS)
                         }
                     } else {
+                        hasSentImageContext = false
                         stopListening(manual = false)
                         updateStatus(
                             state = "连接中断",
@@ -1035,14 +1077,22 @@ class MainActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(assistRecognitionTimeoutRunnable)
     }
 
-    private fun speakAnswer(answer: String) {
-        val utteranceId = "openclaw-${System.currentTimeMillis()}"
+    private fun speakAnswer(answer: String, utteranceId: String = "openclaw-${System.currentTimeMillis()}") {
+        Log.i(TAG, "speakAnswer: mode=$speakerMode ttsReady=$ttsReady utteranceId=$utteranceId")
+        ensureAudioOutputReady()
+        currentTtsTimeoutMs = estimateTtsTimeout(answer)
         when (speakerMode) {
             SpeakerMode.ROKID_BINDER -> {
                 val started = rokidTtsClient?.speak(answer, utteranceId) == true
                 if (!started) {
                     fallbackToSystemTts("Rokid TtsService 调用失败")
                     if (!speakWithSystemTts(answer, utteranceId)) {
+                        pendingSpeech = PendingSpeech(answer, utteranceId)
+                        Log.w(TAG, "speakAnswer: system TTS not ready, queued $utteranceId")
+                        if (!ttsReady) {
+                            appendSystemMessage("系统 TTS 初始化中，稍后自动播报")
+                            return
+                        }
                         handleTtsPlaybackStopped()
                     }
                 }
@@ -1050,6 +1100,8 @@ class MainActivity : AppCompatActivity() {
 
             SpeakerMode.SYSTEM_TTS -> {
                 if (!speakWithSystemTts(answer, utteranceId)) {
+                    pendingSpeech = PendingSpeech(answer, utteranceId)
+                    Log.w(TAG, "speakAnswer: system TTS speak failed, queued $utteranceId")
                     handleTtsPlaybackStopped()
                 }
             }
@@ -1061,8 +1113,36 @@ class MainActivity : AppCompatActivity() {
     private fun speakWithSystemTts(answer: String, utteranceId: String): Boolean {
         val speaker = tts ?: return false
         speaker.stop()
-        speaker.speak(answer, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-        return true
+        val result = speaker.speak(answer, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        if (result == TextToSpeech.ERROR) {
+            Log.e(TAG, "speakWithSystemTts failed for $utteranceId")
+        }
+        return result != TextToSpeech.ERROR
+    }
+
+    private fun estimateTtsTimeout(text: String): Long {
+        val estimated = 8000L + (text.length.coerceAtMost(400) * 90L)
+        return estimated.coerceIn(10_000L, MAX_TTS_TIMEOUT_MS)
+    }
+
+    private fun ensureAudioOutputReady() {
+        runCatching {
+            val audioManager = getSystemService(AudioManager::class.java) ?: return
+            val maxMusic = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            if (maxMusic <= 0) {
+                return
+            }
+            val minTarget = (maxMusic * 0.45f).toInt().coerceAtLeast(3)
+            val currentMusic = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (currentMusic < minTarget) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, minTarget, 0)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioManager.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "ensureAudioOutputReady failed", error)
+        }
     }
 
     private fun stopSpeaking() {
@@ -1090,12 +1170,23 @@ class MainActivity : AppCompatActivity() {
         reportAsrFinal(normalizedQuestion)
         appendUserMessage(normalizedQuestion)
         liveTranscriptText.text = "你: $normalizedQuestion"
+        val forceRecapture = RECAPTURE_KEYWORDS.any { normalizedQuestion.contains(it, ignoreCase = true) }
+        val shouldCapture = forceRecapture || !hasSentImageContext
         updateStatus(
             state = "思考中",
-            detail = "正在拍照并把当前画面和问题发送给 OpenClaw Bridge...",
+            detail = if (shouldCapture) {
+                "正在拍照并把当前画面和问题发送给 OpenClaw Bridge..."
+            } else {
+                "正在复用上一帧画面并发送问题给 OpenClaw Bridge..."
+            },
         )
         updateActionState()
-        manager.captureAndAsk(normalizedQuestion.ifBlank { DEFAULT_VOICE_PROMPT })
+        if (shouldCapture) {
+            hasSentImageContext = true
+            manager.captureAndAsk(normalizedQuestion.ifBlank { DEFAULT_VOICE_PROMPT })
+        } else {
+            manager.askAboutLatest(normalizedQuestion.ifBlank { DEFAULT_VOICE_PROMPT })
+        }
     }
 
     private fun updateStatus(state: String, detail: String) {
@@ -1227,6 +1318,7 @@ class MainActivity : AppCompatActivity() {
         }
         speechRecognizer?.destroy()
         stopSpeaking()
+        mainHandler.removeCallbacks(ttsTimeoutRunnable)
         tts?.shutdown()
         rokidAssistClient?.release()
         rokidTtsClient?.release()

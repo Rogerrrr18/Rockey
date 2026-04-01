@@ -471,7 +471,7 @@ class HuoyanManager(
             mainHandler.post { resultListener.onConnectionChanged(false) }
             val detail =
                 if (error.contains("/127.0.0.1:2478")) {
-                    "OpenClaw Bridge 2478 未就绪: $error。请在主机执行 adb reverse tcp:2478 tcp:18789，并确认 OpenClaw gateway 正在监听 18789。"
+                    "OpenClaw Bridge 2478 未就绪: $error。请优先在主机执行 adb reverse tcp:2478 tcp:2478；若仍使用旧链路，再尝试 adb reverse tcp:2478 tcp:18789，并确认 OpenClaw gateway 正在监听。"
                 } else if (error.contains("connect", ignoreCase = true) || error.contains("failed", ignoreCase = true)) {
                     "OpenClaw Bridge 2478 连接失败: $error"
                 } else {
