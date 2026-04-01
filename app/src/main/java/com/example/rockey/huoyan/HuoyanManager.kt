@@ -55,6 +55,7 @@ class HuoyanManager(
         fun onStatus(message: String)
         fun onAnswer(answer: String, summary: String, raw: JSONObject)
         fun onError(error: String)
+        fun onBackgroundSync(success: Boolean, message: String)
         fun onModeChanged(enabled: Boolean)
         fun onConnectionChanged(connected: Boolean)
     }
@@ -71,16 +72,22 @@ class HuoyanManager(
         val content: String,
     )
 
+    private data class PendingCaptureRequest(
+        val question: String? = null,
+        val silent: Boolean = false,
+    )
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val conversationTurns = mutableListOf<ConversationTurn>()
     private val bridgeResponses = mutableMapOf<String, StringBuilder>()
     private var timer: Timer? = null
     private var continuousMode = false
     private var intervalMs = 5000L
-    private var pendingQuestionAfterUpload: String? = null
+    private var pendingCaptureRequest: PendingCaptureRequest? = null
     private var latestBridgeAttachment: BridgeAttachment? = null
     private var protocolMode = ProtocolMode.UNKNOWN
     private var bridgeSessionKey = UUID.randomUUID().toString()
+    private val silentBridgeRequests = mutableSetOf<String>()
 
     init {
         socketClient.setListener(InternalSocketListener())
@@ -98,7 +105,7 @@ class HuoyanManager(
     fun isContinuousMode(): Boolean = continuousMode
 
     fun startContinuousMode() {
-        if (protocolMode == ProtocolMode.OPENCLAW_BRIDGE) {
+        if (prefersBridgeProtocol()) {
             resultListener.onError("当前 OpenClaw Bridge 仅支持对话协议，不支持连续图像模式")
             return
         }
@@ -142,7 +149,8 @@ class HuoyanManager(
             resultListener.onError("WebSocket 未连接")
             return
         }
-        if (protocolMode == ProtocolMode.OPENCLAW_BRIDGE) {
+        pendingCaptureRequest = null
+        if (prefersBridgeProtocol()) {
             resultListener.onStatus("正在拍照并缓存给 OpenClaw Bridge...")
         }
         captureAndUpload()
@@ -161,12 +169,11 @@ class HuoyanManager(
 
         val outgoingQuestion = buildOutgoingQuestion(normalizedQuestion)
         rememberTurn("user", normalizedQuestion)
-        if (protocolMode == ProtocolMode.OPENCLAW_BRIDGE) {
-            pendingQuestionAfterUpload = outgoingQuestion
+        pendingCaptureRequest = PendingCaptureRequest(question = outgoingQuestion)
+        if (prefersBridgeProtocol()) {
             resultListener.onStatus("正在拍照并把图像和问题发送给 OpenClaw Bridge...")
             captureAndUpload()
         } else {
-            pendingQuestionAfterUpload = outgoingQuestion
             resultListener.onStatus("正在拍照并发送给 OpenClaw...")
             captureAndUpload()
         }
@@ -185,7 +192,7 @@ class HuoyanManager(
 
         rememberTurn("user", normalizedQuestion)
         val outgoingQuestion = buildOutgoingQuestion(normalizedQuestion)
-        if (protocolMode == ProtocolMode.OPENCLAW_BRIDGE) {
+        if (prefersBridgeProtocol()) {
             val attachment = latestBridgeAttachment
             if (attachment != null) {
                 resultListener.onStatus("正在把最新画面和问题发送给 OpenClaw Bridge...")
@@ -199,34 +206,70 @@ class HuoyanManager(
         }
     }
 
+    fun syncLatestFrame(prompt: String): Boolean {
+        val normalizedPrompt = prompt.trim()
+        if (normalizedPrompt.isEmpty()) {
+            resultListener.onBackgroundSync(false, "后台画面同步失败: 同步提示词为空")
+            return false
+        }
+        if (!socketClient.isConnected()) {
+            resultListener.onBackgroundSync(false, "后台画面同步失败: OpenClaw Bridge 未连接")
+            return false
+        }
+        if (protocolMode == ProtocolMode.LEGACY_HUOYAN) {
+            resultListener.onBackgroundSync(false, "后台画面同步仅支持 OpenClaw Bridge 协议")
+            return false
+        }
+
+        pendingCaptureRequest =
+            PendingCaptureRequest(
+                question = normalizedPrompt,
+                silent = true,
+            )
+        resultListener.onStatus("后台画面同步中...")
+        captureAndUpload()
+        return true
+    }
+
     fun release() {
         stopContinuousMode()
+        pendingCaptureRequest = null
+        silentBridgeRequests.clear()
         socketClient.close()
     }
 
     private fun captureAndUpload() {
         cameraProvider.capture(object : PhotoCallback {
             override fun onSuccess(imageBytes: ByteArray) {
+                val request = pendingCaptureRequest
+                pendingCaptureRequest = null
                 if (imageBytes.isEmpty()) {
-                    postError("拍照返回空数据")
+                    handleCaptureFailure(request, "拍照返回空数据")
                     return
                 }
                 if (!socketClient.isConnected()) {
-                    postError("连接已断开，无法上传图片")
+                    handleCaptureFailure(request, "连接已断开，无法上传图片")
                     return
                 }
-                if (protocolMode == ProtocolMode.OPENCLAW_BRIDGE) {
+                if (prefersBridgeProtocol()) {
                     val attachment = buildBridgeAttachment(imageBytes)
                     if (attachment == null) {
-                        postError("图片编码失败，无法发送给 OpenClaw Bridge")
+                        handleCaptureFailure(request, "图片编码失败，无法发送给 OpenClaw Bridge")
                         return
                     }
                     latestBridgeAttachment = attachment
-                    val question = pendingQuestionAfterUpload
-                    pendingQuestionAfterUpload = null
+                    val question = request?.question
                     if (!question.isNullOrBlank()) {
-                        sendBridgeQuestion(question, listOf(attachment))
-                        postStatus("已拍照，正在把图像和问题发送给 OpenClaw Bridge")
+                        sendBridgeQuestion(
+                            question = question,
+                            attachments = listOf(attachment),
+                            silent = request?.silent == true,
+                        )
+                        if (request?.silent == true) {
+                            postStatus("后台画面已发送，等待 OpenClaw 同步")
+                        } else {
+                            postStatus("已拍照，正在把图像和问题发送给 OpenClaw Bridge")
+                        }
                     } else {
                         postStatus("已缓存当前画面，可继续提问")
                     }
@@ -237,7 +280,9 @@ class HuoyanManager(
             }
 
             override fun onError(error: String) {
-                postError("拍照失败: $error")
+                val request = pendingCaptureRequest
+                pendingCaptureRequest = null
+                handleCaptureFailure(request, "拍照失败: $error")
             }
         })
     }
@@ -254,7 +299,7 @@ class HuoyanManager(
     }
 
     private fun sendQuestion(question: String) {
-        if (protocolMode == ProtocolMode.OPENCLAW_BRIDGE) {
+        if (prefersBridgeProtocol()) {
             sendBridgeQuestion(question)
             return
         }
@@ -273,9 +318,13 @@ class HuoyanManager(
     private fun sendBridgeQuestion(
         question: String,
         attachments: List<BridgeAttachment> = emptyList(),
+        silent: Boolean = false,
     ) {
         val requestId = UUID.randomUUID().toString()
         bridgeResponses[requestId] = StringBuilder()
+        if (silent) {
+            silentBridgeRequests += requestId
+        }
         val history = buildBridgeHistory()
         val payload = try {
             JSONObject().apply {
@@ -284,6 +333,9 @@ class HuoyanManager(
                 put("sessionKey", bridgeSessionKey)
                 if (history.length() > 0) {
                     put("history", history)
+                }
+                if (silent) {
+                    put("silent", true)
                 }
                 if (attachments.isNotEmpty()) {
                     put("attachments", JSONArray().apply {
@@ -308,13 +360,15 @@ class HuoyanManager(
             ).toString()
         }
         socketClient.sendText(payload)
-        postStatus(
-            if (attachments.isNotEmpty()) {
-                "图像和问题已发送，等待 OpenClaw Bridge 回复"
-            } else {
-                "问题已发送，等待 OpenClaw Bridge 回复"
-            },
-        )
+        if (!silent) {
+            postStatus(
+                if (attachments.isNotEmpty()) {
+                    "图像和问题已发送，等待 OpenClaw Bridge 回复"
+                } else {
+                    "问题已发送，等待 OpenClaw Bridge 回复"
+                },
+            )
+        }
     }
 
     private fun buildBridgeAttachment(imageBytes: ByteArray): BridgeAttachment? {
@@ -343,10 +397,20 @@ class HuoyanManager(
     }
 
     private fun buildOutgoingQuestion(question: String): String {
-        return if (protocolMode == ProtocolMode.OPENCLAW_BRIDGE) {
+        return if (prefersBridgeProtocol()) {
             question
         } else {
             buildContextualQuestion(question)
+        }
+    }
+
+    private fun prefersBridgeProtocol(): Boolean = protocolMode != ProtocolMode.LEGACY_HUOYAN
+
+    private fun handleCaptureFailure(request: PendingCaptureRequest?, message: String) {
+        if (request?.silent == true) {
+            mainHandler.post { resultListener.onBackgroundSync(false, "后台画面同步失败: $message") }
+        } else {
+            postError(message)
         }
     }
 
@@ -410,8 +474,8 @@ class HuoyanManager(
             when (val type = obj.optString("type")) {
                     "welcome", "image_received", "mode_changed", "status" -> {
                         if (type == "image_received") {
-                            val question = pendingQuestionAfterUpload
-                            pendingQuestionAfterUpload = null
+                            val question = pendingCaptureRequest?.question
+                            pendingCaptureRequest = null
                             if (!question.isNullOrBlank()) {
                                 sendQuestion(question)
                             }
@@ -425,7 +489,7 @@ class HuoyanManager(
                         mainHandler.post { resultListener.onAnswer(answer, summary, obj) }
                     }
                     "error", "analysis_error", "answer_error" -> {
-                        pendingQuestionAfterUpload = null
+                        pendingCaptureRequest = null
                         postError(obj.optString("message", "未知错误"))
                     }
                     else -> postStatus("收到消息: $type")
@@ -446,14 +510,21 @@ class HuoyanManager(
 
         private fun handleBridgeError(obj: JSONObject) {
             markProtocol(ProtocolMode.OPENCLAW_BRIDGE)
-            pendingQuestionAfterUpload = null
+            pendingCaptureRequest = null
             val requestId = obj.optString("requestId")
+            val isSilent = requestId.isNotBlank() && silentBridgeRequests.remove(requestId)
             if (requestId.isNotBlank()) {
                 bridgeResponses.remove(requestId)
             }
             val code = obj.optString("code").ifBlank { "UNKNOWN" }
             val message = obj.optString("message").ifBlank { "未知错误" }
-            postError("OpenClaw Bridge 请求失败[$code]: $message")
+            if (isSilent) {
+                mainHandler.post {
+                    resultListener.onBackgroundSync(false, "后台画面同步失败[$code]: $message")
+                }
+            } else {
+                postError("OpenClaw Bridge 请求失败[$code]: $message")
+            }
         }
 
         private fun handleBridgeEvent(obj: JSONObject) {
@@ -466,8 +537,9 @@ class HuoyanManager(
         }
 
         override fun onError(error: String) {
-            pendingQuestionAfterUpload = null
+            pendingCaptureRequest = null
             bridgeResponses.clear()
+            silentBridgeRequests.clear()
             mainHandler.post { resultListener.onConnectionChanged(false) }
             val detail =
                 if (error.contains("/127.0.0.1:2478")) {
@@ -481,8 +553,9 @@ class HuoyanManager(
         }
 
         override fun onClose() {
-            pendingQuestionAfterUpload = null
+            pendingCaptureRequest = null
             bridgeResponses.clear()
+            silentBridgeRequests.clear()
             mainHandler.post { resultListener.onConnectionChanged(false) }
             postStatus("OpenClaw 慧眼连接已关闭")
         }
@@ -493,6 +566,9 @@ class HuoyanManager(
             }
             val requestId = data.optString("message_id")
             if (requestId.isBlank()) {
+                return
+            }
+            if (silentBridgeRequests.contains(requestId)) {
                 return
             }
             val chunk = data.optString("answer_stream")
@@ -509,7 +585,12 @@ class HuoyanManager(
                 return
             }
             val requestId = data.optString("message_id")
+            val isSilent = requestId.isNotBlank() && silentBridgeRequests.remove(requestId)
             val answer = bridgeResponses.remove(requestId)?.toString()?.trim().orEmpty()
+            if (isSilent) {
+                mainHandler.post { resultListener.onBackgroundSync(true, "后台画面已同步到 OpenClaw") }
+                return
+            }
             if (answer.isNotBlank()) {
                 rememberTurn("assistant", answer)
             }

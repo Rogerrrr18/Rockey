@@ -27,6 +27,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.example.rockey.camera.RokidCameraIntegration
 import com.example.rockey.huoyan.HuoyanManager
+import com.example.rockey.sync.PeriodicFrameSyncScheduler
 import com.example.rockey.voice.RokidAssistClient
 import com.example.rockey.voice.RokidTtsClient
 import com.example.rockey.ws.OkHttpSocketClient
@@ -34,8 +35,8 @@ import com.google.android.material.button.MaterialButton
 import com.rokid.arsdk.connection.DeviceInfo
 import com.rokid.cxr.client.utils.ValueUtil
 import com.rokid.os.sprite.assist.basic.AssistMessage
-import org.json.JSONObject
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.Locale
@@ -46,6 +47,8 @@ class MainActivity : AppCompatActivity() {
         private const val WS_URL = "ws://127.0.0.1:2478"
         private val WS_FALLBACK_URLS = listOf("ws://127.0.0.1:18789")
         private const val DEFAULT_VOICE_PROMPT = "请直接分析我眼前的画面，并告诉我最重要的信息。"
+        private const val AUTO_FRAME_SYNC_INTERVAL_MS = 60_000L
+        private const val AUTO_FRAME_SYNC_PROMPT = "系统同步当前画面，请更新视觉上下文并保持静默，无需回复。"
         private const val RETRY_LISTEN_DELAY_MS = 900L
         private const val MAX_TTS_TIMEOUT_MS = 45_000L
         private const val ROKID_ASSIST_PACKAGE = "com.rokid.os.sprite.assistserver"
@@ -110,6 +113,17 @@ class MainActivity : AppCompatActivity() {
     private var pendingSpeech: PendingSpeech? = null
     private var currentTtsTimeoutMs = MAX_TTS_TIMEOUT_MS
     private var hasSentImageContext = false
+    private var backgroundSyncInFlight = false
+    private var autoFrameSyncAnnounced = false
+
+    private val frameSyncScheduler by lazy {
+        PeriodicFrameSyncScheduler(
+            handler = mainHandler,
+            intervalMs = AUTO_FRAME_SYNC_INTERVAL_MS,
+            shouldRun = ::shouldRunAutoFrameSync,
+            onTick = ::runAutoFrameSync,
+        )
+    }
 
     private val restartListeningRunnable = Runnable {
         startListening(reason = "auto")
@@ -148,6 +162,8 @@ class MainActivity : AppCompatActivity() {
                 appendSystemMessage("权限已就绪，继续进入语音模式")
                 bootstrapSession(forceReconnect = false)
             } else {
+                frameSyncScheduler.stop()
+                backgroundSyncInFlight = false
                 updateStatus(
                     state = "权限不足",
                     detail = "缺少相机、麦克风或设备连接权限",
@@ -672,6 +688,8 @@ class MainActivity : AppCompatActivity() {
 
         bootstrapInProgress = true
         awaitingAnswer = false
+        backgroundSyncInFlight = false
+        refreshFrameSyncScheduling()
         cancelScheduledListening()
         stopListening(manual = false)
 
@@ -755,7 +773,9 @@ class MainActivity : AppCompatActivity() {
                         aiSceneActive = false
                         wsConnected = false
                         awaitingAnswer = false
+                        backgroundSyncInFlight = false
                         stopListening(manual = false)
+                        refreshFrameSyncScheduling()
                         updateStatus(
                             state = "已断开",
                             detail = "Rokid 眼镜连接已断开",
@@ -764,11 +784,15 @@ class MainActivity : AppCompatActivity() {
                         updateActionState()
                     },
                     onConnectFailed = { code, msg ->
+                        backgroundSyncInFlight = false
+                        refreshFrameSyncScheduling()
                         onBootstrapFailed("连接设备失败: $msg ($code)")
                     },
                 )
             },
             onScanError = { code, msg ->
+                backgroundSyncInFlight = false
+                refreshFrameSyncScheduling()
                 onBootstrapFailed("识别设备失败: $msg ($code)")
             },
         )
@@ -856,6 +880,24 @@ class MainActivity : AppCompatActivity() {
                     scheduleListening(RETRY_LISTEN_DELAY_MS)
                 }
 
+                override fun onBackgroundSync(success: Boolean, message: String) {
+                    backgroundSyncInFlight = false
+                    runOnUiThread {
+                        if (success) {
+                            statusText.text = message
+                        } else {
+                            appendSystemMessage(message)
+                            if (!awaitingAnswer && !isSpeaking) {
+                                updateStatus(
+                                    state = if (wsConnected) "后台同步异常" else "连接异常",
+                                    detail = message,
+                                )
+                            }
+                        }
+                    }
+                    refreshFrameSyncScheduling()
+                }
+
                 override fun onModeChanged(enabled: Boolean) {
                     appendSystemMessage(if (enabled) "连续模式已开启" else "连续模式已关闭")
                 }
@@ -863,6 +905,7 @@ class MainActivity : AppCompatActivity() {
                 override fun onConnectionChanged(connected: Boolean) {
                     wsConnected = connected
                     bootstrapInProgress = false
+                    backgroundSyncInFlight = false
                     if (connected) {
                         hasSentImageContext = false
                         updateStatus(
@@ -890,6 +933,7 @@ class MainActivity : AppCompatActivity() {
                             detail = "OpenClaw Bridge 2478 已断开",
                         )
                     }
+                    refreshFrameSyncScheduling()
                     updateActionState()
                 }
             },
@@ -1246,6 +1290,8 @@ class MainActivity : AppCompatActivity() {
         rokidConnected = false
         wsConnected = false
         awaitingAnswer = false
+        backgroundSyncInFlight = false
+        refreshFrameSyncScheduling()
         stopListening(manual = false)
         updateStatus(
             state = "启动失败",
@@ -1266,6 +1312,13 @@ class MainActivity : AppCompatActivity() {
         return ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun hasCameraPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.CAMERA,
         ) == PackageManager.PERMISSION_GRANTED
     }
 
@@ -1305,11 +1358,52 @@ class MainActivity : AppCompatActivity() {
         return permissions
     }
 
+    private fun shouldRunAutoFrameSync(): Boolean {
+        return rokidConnected &&
+            wsConnected &&
+            !bootstrapInProgress &&
+            !awaitingAnswer &&
+            !isListening &&
+            !isSpeaking &&
+            !backgroundSyncInFlight &&
+            hasCameraPermission() &&
+            rokid?.isConnected() == true
+    }
+
+    private fun runAutoFrameSync() {
+        val manager = huoyanManager ?: return
+        if (!shouldRunAutoFrameSync()) {
+            return
+        }
+        backgroundSyncInFlight = true
+        val started = manager.syncLatestFrame(AUTO_FRAME_SYNC_PROMPT)
+        if (!started) {
+            backgroundSyncInFlight = false
+            refreshFrameSyncScheduling()
+        }
+    }
+
+    private fun refreshFrameSyncScheduling() {
+        if (rokidConnected && wsConnected && hasCameraPermission()) {
+            frameSyncScheduler.start()
+            frameSyncScheduler.reset()
+            if (!autoFrameSyncAnnounced) {
+                appendSystemMessage("后台画面同步已开启：每 1 分钟抓拍一张并同步到 OpenClaw")
+                autoFrameSyncAnnounced = true
+            }
+        } else {
+            frameSyncScheduler.stop()
+            autoFrameSyncAnnounced = false
+        }
+    }
+
     private fun setViewAlpha(view: View, alpha: Float) {
         view.alpha = alpha
     }
 
     override fun onDestroy() {
+        frameSyncScheduler.stop()
+        backgroundSyncInFlight = false
         cancelScheduledListening()
         cancelAssistRecognition()
         stopListening(manual = false)
